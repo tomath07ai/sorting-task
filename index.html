@@ -96,13 +96,29 @@
   <section id="doneScreen" hidden>
     <h1>作答完成，謝謝你</h1>
     <p id="doneText"></p>
-    <textarea id="csvBox" rows="14" readonly hidden></textarea>
+    <!-- 只有在沒有設定 endpoint 或傳送失敗時才會出現 -->
+    <button class="btn" id="downloadBtn" hidden>下載 CSV</button>
   </section>
 </main>
 
 <script>
-// ===== 資料接收網址：貼上 Google Apps Script 的網址；空字串時，結束後在畫面上顯示 CSV =====
-const ENDPOINT = "https://script.google.com/macros/s/AKfycbwsLwfFIZFmKIWUbGyLZSxBm3z7edoYGLkSdvKMyiUq37Zr4CGfBKluGI4CZqrhduG3NA/exec";
+// ===== 研究者要修改的設定 =====
+const CONFIG = {
+  // 資料接收網址：貼上 Google Apps Script 的網址（結尾是 /exec）
+  // 空字串時不傳送，結束畫面直接出現「下載 CSV」按鈕
+  endpoint: "https://script.google.com/macros/s/AKfycbwsLwfFIZFmKIWUbGyLZSxBm3z7edoYGLkSdvKMyiUq37Zr4CGfBKluGI4CZqrhduG3NA/exec",
+  // 第幾次施測。第二次施測時可以改成 2，
+  // 或是不改程式、把網址寫成 https://……/sorting-task/?session=2
+  session: 1,
+  // 傳送等待的上限（毫秒），超過就當作傳送失敗
+  timeoutMs: 20000
+};
+
+// 網址上有 ?session= 時，以網址為準
+const SESSION = (function () {
+  const s = new URLSearchParams(location.search).get("session");
+  return s && /^\d+$/.test(s) ? Number(s) : CONFIG.session;
+})();
 
 // ===== 類別與字詞 =====
 // category 的代碼：concept1 = 概念 1、concept2 = 概念 2、attr1 = 正向屬性、attr2 = 負向屬性
@@ -306,38 +322,117 @@ document.addEventListener("keydown", e => {
   else if (k === "i") respond("right");
 });
 
-// ===== 結束：送出資料或顯示 CSV =====
+// ===== 計分：計算這位受測者的 D 分數 =====
+// 四捨五入到小數第四位；無法計算的值（NaN）一律設為 null，傳送時就是空白
+function round4(x) {
+  return (x === null || !isFinite(x)) ? null : Math.round(x * 10000) / 10000;
+}
+
+// 平均數
+function mean(arr) {
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+// 標準差，分母用 n − 1（與 R 的 sd() 相同）
+function sd(arr) {
+  const m = mean(arr);
+  return Math.sqrt(arr.reduce((a, b) => a + (b - m) * (b - m), 0) / (arr.length - 1));
+}
+
+// 一個階段（practice 或 test）的結果：
+// （配對 B 的平均 − 配對 A 的平均）÷ 這個階段配對 A 與配對 B 全部反應時間的標準差
+function partD(rows, phase) {
+  const a = rows.filter(r => r.phase === phase && r.pairing === "A").map(r => r.rt_ms);
+  const b = rows.filter(r => r.phase === phase && r.pairing === "B").map(r => r.rt_ms);
+  if (a.length === 0 || b.length === 0) return null;
+  return (mean(b) - mean(a)) / sd(a.concat(b));
+}
+
+function computeScore(data) {
+  // (1) 只使用 phase 是 practice 與 test 的資料
+  // (2) 刪除 rt_ms 超過 10000 的嘗試
+  const rows = data.filter(r => (r.phase === "practice" || r.phase === "test") && r.rt_ms <= 10000);
+  const n = rows.length;
+  // 錯誤率：曾經按錯（correct 是 0）的比例；過快比例：rt_ms 小於 300 的比例
+  const errorRate = n ? rows.filter(r => r.correct === 0).length / n : null;
+  const fastRate = n ? rows.filter(r => r.rt_ms < 300).length / n : null;
+  // (3) 練習段與正式段各算一次
+  const dPractice = partD(rows, "practice");
+  const dTest = partD(rows, "test");
+  // (4) D 是兩個結果的平均
+  let d = (dPractice === null || dTest === null) ? null : (dPractice + dTest) / 2;
+  // (5) 過快的比例超過 10% 時，D 設為空白
+  if (fastRate === null || fastRate > 0.10) d = null;
+  return {
+    n_trials: n,
+    error_rate: round4(errorRate),
+    fast_rate: round4(fastRate),
+    D_practice: round4(dPractice),
+    D_test: round4(dTest),
+    D: round4(d)
+  };
+}
+
+// ===== 原始資料的 CSV（給「下載 CSV」按鈕使用）=====
 const FIELDS = ["participant_id", "order", "block", "pairing", "phase", "trial", "category", "stimulus", "correct", "rt_ms"];
 
 function toCSV(rows) {
   const lines = [FIELDS.join(",")];
   rows.forEach(r => lines.push(FIELDS.map(f => r[f]).join(",")));
-  return lines.join("\n");
+  return lines.join("\r\n");
 }
 
+// 讓受測者把原始資料存成 CSV 檔；最前面加上 BOM，Excel 打開中文才不會變成亂碼
+function downloadCSV() {
+  const blob = new Blob(["﻿" + toCSV(DATA)], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "iat_" + participantId + "_session" + SESSION + ".csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+document.getElementById("downloadBtn").addEventListener("click", downloadCSV);
+
+// ===== 結束：計分、傳送；沒有 endpoint 或傳送失敗時提供下載 =====
+// 結束畫面不顯示任何分數或反應時間
 function finish() {
   show("doneScreen");
   const doneText = document.getElementById("doneText");
+  const score = computeScore(DATA);   // 只放進傳送的內容，不顯示在畫面上
 
-  // ENDPOINT 是空字串：把資料以 CSV 顯示在畫面上
-  if (ENDPOINT === "") {
-    doneText.textContent = "目前沒有設定 ENDPOINT，以下是本次的資料（CSV）：";
-    const box = document.getElementById("csvBox");
-    box.value = toCSV(DATA);
-    box.hidden = false;
+  // 顯示「下載 CSV」按鈕
+  function offerDownload() {
+    doneText.textContent = "請按下面的按鈕，把作答資料存成檔案，交給研究人員。";
+    document.getElementById("downloadBtn").hidden = false;
+  }
+
+  // endpoint 是空的：不傳送，直接提供下載
+  if (!CONFIG.endpoint) {
+    offerDownload();
     return;
   }
 
-  // 有設定 ENDPOINT：用 POST 送出 JSON
-  doneText.textContent = "資料傳送中，請稍候，不要關閉這個頁面……";
-  fetch(ENDPOINT, {
+  // 用 POST 送出原始資料與分數；Content-Type 用 text/plain
+  doneText.textContent = "請稍候，不要關閉這個頁面……";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONFIG.timeoutMs);
+  fetch(CONFIG.endpoint, {
     method: "POST",
-    mode: "no-cors",
     headers: { "Content-Type": "text/plain" },
-    body: JSON.stringify({ id: participantId, order: ORDER, trials: DATA })
+    body: JSON.stringify({ id: participantId, session: SESSION, order: ORDER, trials: DATA, score: score }),
+    signal: controller.signal
   })
-    .then(() => { doneText.textContent = "資料已送出，現在可以關閉這個頁面。"; })
-    .catch(() => { doneText.textContent = "資料傳送失敗，請不要關閉這個頁面，並通知研究人員。"; });
+    .then(res => res.text())
+    .then(text => {
+      clearTimeout(timer);
+      // 伺服器回傳文字 ok 才算成功；其他回應都當作失敗
+      if (text.trim() === "ok") doneText.textContent = "現在可以關閉這個頁面。";
+      else offerDownload();
+    })
+    .catch(() => { clearTimeout(timer); offerDownload(); });
 }
 </script>
 </body>
