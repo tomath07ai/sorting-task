@@ -384,7 +384,8 @@ function toCSV(rows) {
 
 // 讓受測者把原始資料存成 CSV 檔；最前面加上 BOM，Excel 打開中文才不會變成亂碼
 function downloadCSV() {
-  const blob = new Blob(["﻿" + toCSV(DATA)], { type: "text/csv;charset=utf-8" });
+  const bom = String.fromCharCode(0xFEFF);
+  const blob = new Blob([bom + toCSV(DATA)], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
